@@ -12,6 +12,7 @@
     "vite": "^8.2.2"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "three": "^0.185.1"
   }
 }
