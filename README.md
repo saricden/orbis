@@ -1,4 +1,4 @@
-# Orbis - VR Environment Generator
+# Orbis - XR Environment Generator
 
 (Work-in-progress)
 
