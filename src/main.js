@@ -20,44 +20,134 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.xr.enabled = true;
 app.appendChild(renderer.domElement);
 
-scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.5));
-const directional = new THREE.DirectionalLight(0xffffff, 1.5);
-directional.position.set(1, 2, 1);
-scene.add(directional);
+// --- Floating text HUD ---------------------------------------------------
+// A canvas-texture plane that trails the camera at a fixed offset (bottom
+// center of view) and crossfades its content via setHudText().
 
-// A small cluster of objects placed a couple of meters in front of the
-// origin (which becomes the headset/device's starting position on session
-// start) so there is something to see against the passthrough feed.
-const group = new THREE.Group();
-group.position.set(0, 0, -1.5);
-scene.add(group);
+const HUD_CANVAS_WIDTH = 1024;
+const HUD_CANVAS_HEIGHT = 384;
+const HUD_WORLD_WIDTH = 0.7;
+const HUD_WORLD_HEIGHT = HUD_WORLD_WIDTH * (HUD_CANVAS_HEIGHT / HUD_CANVAS_WIDTH);
+const HUD_OFFSET = new THREE.Vector3(0, -0.28, -0.8);
+const HUD_FOLLOW_LAMBDA = 6;
+const HUD_FADE_MS = 1500;
 
-const cube = new THREE.Mesh(
-  new THREE.BoxGeometry(0.2, 0.2, 0.2),
-  new THREE.MeshStandardMaterial({ color: 0x2196f3 }),
+const hudCanvas = document.createElement('canvas');
+hudCanvas.width = HUD_CANVAS_WIDTH;
+hudCanvas.height = HUD_CANVAS_HEIGHT;
+const hudCtx = hudCanvas.getContext('2d');
+
+const hudTexture = new THREE.CanvasTexture(hudCanvas);
+hudTexture.colorSpace = THREE.SRGBColorSpace;
+
+const hudMaterial = new THREE.MeshBasicMaterial({
+  map: hudTexture,
+  transparent: true,
+  opacity: 0,
+  depthTest: false,
+  depthWrite: false,
+});
+
+const hudMesh = new THREE.Mesh(
+  new THREE.PlaneGeometry(HUD_WORLD_WIDTH, HUD_WORLD_HEIGHT),
+  hudMaterial,
 );
-cube.position.set(-0.3, 0, 0);
-group.add(cube);
+hudMesh.renderOrder = 999;
+hudMesh.position.copy(camera.position).add(HUD_OFFSET);
+scene.add(hudMesh);
 
-const sphere = new THREE.Mesh(
-  new THREE.SphereGeometry(0.12, 32, 16),
-  new THREE.MeshStandardMaterial({ color: 0xff5722 }),
-);
-sphere.position.set(0.3, 0, 0);
-group.add(sphere);
+const hudFade = {
+  from: 0,
+  to: 0,
+  start: 0,
+  pendingText: null,
+};
 
-const ring = new THREE.Mesh(
-  new THREE.TorusGeometry(0.15, 0.03, 16, 48),
-  new THREE.MeshStandardMaterial({ color: 0x4caf50 }),
-);
-group.add(ring);
+function drawHudText(text) {
+  const w = hudCanvas.width;
+  const h = hudCanvas.height;
+  hudCtx.clearRect(0, 0, w, h);
 
-renderer.setAnimationLoop((time) => {
-  const t = time * 0.001;
-  cube.rotation.set(t * 0.6, t * 0.8, 0);
-  sphere.position.y = Math.sin(t) * 0.1;
-  ring.rotation.x = t * 0.4;
+  const lines = text.split('\n');
+  const fontSize = Math.max(18, Math.min(40, (h - 64) / lines.length / 1.25));
+  const lineHeight = fontSize * 1.25;
+  const blockHeight = lineHeight * lines.length;
+  const startY = h / 2 - blockHeight / 2 + lineHeight / 2;
 
+  hudCtx.font = `600 ${fontSize}px system-ui, sans-serif`;
+  hudCtx.textAlign = 'center';
+  hudCtx.textBaseline = 'middle';
+  hudCtx.lineJoin = 'round';
+  hudCtx.lineWidth = fontSize * 0.18;
+  hudCtx.strokeStyle = 'rgba(0, 0, 0, 0.85)';
+  hudCtx.fillStyle = '#ffffff';
+
+  lines.forEach((line, i) => {
+    const y = startY + i * lineHeight;
+    hudCtx.strokeText(line, w / 2, y);
+    hudCtx.fillText(line, w / 2, y);
+  });
+
+  hudTexture.needsUpdate = true;
+}
+
+// Fades the HUD out, swaps in `text` (multi-line via \n), then fades back in.
+function setHudText(text) {
+  const now = performance.now();
+
+  if (hudMaterial.opacity <= 0.01) {
+    // Already invisible: skip the fade-out leg and go straight to fade-in.
+    drawHudText(text);
+    hudFade.pendingText = null;
+    hudFade.from = hudMaterial.opacity;
+    hudFade.to = 1;
+    hudFade.start = now;
+  }
+  else {
+    hudFade.pendingText = text;
+    hudFade.from = hudMaterial.opacity;
+    hudFade.to = 0;
+    hudFade.start = now;
+  }
+}
+
+function updateHud(delta) {
+  const now = performance.now();
+  const progress = Math.min((now - hudFade.start) / HUD_FADE_MS, 1);
+  const eased = progress * progress * (3 - 2 * progress);
+  hudMaterial.opacity = THREE.MathUtils.lerp(hudFade.from, hudFade.to, eased);
+
+  if (progress >= 1 && hudFade.to === 0 && hudFade.pendingText !== null) {
+    drawHudText(hudFade.pendingText);
+    hudFade.pendingText = null;
+    hudFade.from = 0;
+    hudFade.to = 1;
+    hudFade.start = now;
+  }
+
+  // Smoothly trail the camera so the panel stays pinned to the bottom
+  // center of view without feeling rigidly locked to head motion.
+  const followAlpha = 1 - Math.exp(-HUD_FOLLOW_LAMBDA * delta);
+  const targetPosition = camera.position
+    .clone()
+    .add(HUD_OFFSET.clone().applyQuaternion(camera.quaternion));
+  hudMesh.position.lerp(targetPosition, followAlpha);
+  hudMesh.quaternion.slerp(camera.quaternion, followAlpha);
+}
+
+const HUD_INITIAL_DELAY_MS = 4000;
+
+renderer.xr.addEventListener('sessionstart', () => {
+  setTimeout(() => {
+    setHudText('Welcome to Orbis.');
+  }, HUD_INITIAL_DELAY_MS);
+});
+
+const clock = new THREE.Clock();
+
+renderer.setAnimationLoop(() => {
+  const delta = clock.getDelta();
+  updateHud(delta);
   renderer.render(scene, camera);
 });
 
@@ -85,11 +175,13 @@ if (navigator.xr) {
           domOverlay: { root: app },
         }),
       );
-    } else {
+    }
+    else {
       showOverlay('This device supports WebXR but not passthrough AR sessions.');
     }
   });
-} else {
+}
+else {
   showOverlay(
     'WebXR is not available in this browser.<br />Try Quest Browser on Quest 3, or Chrome on an ARCore-capable Android phone.',
   );
