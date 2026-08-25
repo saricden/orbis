@@ -6,12 +6,14 @@
   "scripts": {
     "dev": "vite",
     "dev:netlify": "netlify dev",
-    "build": "vite build",
+    "build": "vite build && node scripts/protect-build.mjs",
     "preview": "vite preview"
   },
   "devDependencies": {
     "netlify-cli": "^26.2.0",
-    "vite": "^8.2.2"
+    "pagecrypt": "^7.1.0",
+    "vite": "^8.2.2",
+    "vite-plugin-singlefile": "^2.3.3"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
