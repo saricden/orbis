@@ -73,18 +73,30 @@ asrWorker.onmessage = (event) => {
     micButton.disabled = false;
   }
   else if (type === 'result') {
-    setHudText(event.data.text || '(no speech detected)');
+    const text = event.data.text;
+
+    if (text) {
+      setHudText(`${text}\n\nGenerating your world...`);
+      requestPanorama(text);
+    }
+    else {
+      setHudText('(no speech detected)');
+      startFadeFromWhite();
+      isGenerating = false;
+    }
   }
   else if (type === 'error') {
     console.error('Speech-to-text error:', event.data.message);
 
     if (!asrReady) {
       downloadButton.disabled = false;
-      downloadButton.textContent = 'Download Model';
+      downloadButton.textContent = 'Prepare Model';
       showOverlay(`Failed to download the speech-to-text model: ${event.data.message}`);
     }
     else {
       setHudText("Sorry, I didn't catch that.");
+      startFadeFromWhite();
+      isGenerating = false;
     }
   }
 };
@@ -312,6 +324,121 @@ renderer.xr.addEventListener('sessionstart', () => {
   }, HUD_INITIAL_DELAY_MS);
 });
 
+// --- Panorama scene ----------------------------------------------------------
+// A generated environment is applied to a big inverted sphere surrounding
+// the world origin, so the user feels like they are standing inside it. A
+// second, smaller inverted sphere (ignoring depth, drawn on top of it but
+// below the HUD) is used purely as a white fade curtain between scenes.
+
+const PANORAMA_ENDPOINT = '/api/generate-panorama';
+const PANORAMA_RADIUS = 30;
+const FADE_RADIUS = 20;
+const WORLD_FADE_MS = 900;
+
+function buildPanoramaGeometry(aspect) {
+  const phiLength = Math.PI * 2; // full horizontal wrap, so turning around works
+  // Vertical FOV derived from the image's real aspect ratio (the API can't
+  // produce true 2:1 equirectangular) so the panorama isn't stretched -
+  // it just doesn't quite reach the poles.
+  const thetaLength = Math.min(Math.PI, phiLength / aspect);
+  const thetaStart = (Math.PI - thetaLength) / 2;
+  return new THREE.SphereGeometry(PANORAMA_RADIUS, 64, 40, 0, phiLength, thetaStart, thetaLength);
+}
+
+const panoramaMaterial = new THREE.MeshBasicMaterial({ side: THREE.BackSide });
+const panoramaMesh = new THREE.Mesh(buildPanoramaGeometry(2), panoramaMaterial);
+panoramaMesh.visible = false;
+scene.add(panoramaMesh);
+
+const fadeMaterial = new THREE.MeshBasicMaterial({
+  color: 0xffffff,
+  side: THREE.BackSide,
+  transparent: true,
+  opacity: 0,
+  depthTest: false,
+  depthWrite: false,
+});
+const fadeMesh = new THREE.Mesh(new THREE.SphereGeometry(FADE_RADIUS, 32, 20), fadeMaterial);
+fadeMesh.renderOrder = 500; // above the panorama, below the HUD (999)
+scene.add(fadeMesh);
+
+const worldFade = { from: 0, to: 0, start: 0 };
+
+function startFadeToWhite() {
+  worldFade.from = fadeMaterial.opacity;
+  worldFade.to = 1;
+  worldFade.start = performance.now();
+}
+
+function startFadeFromWhite() {
+  worldFade.from = fadeMaterial.opacity;
+  worldFade.to = 0;
+  worldFade.start = performance.now();
+}
+
+function updateWorldFade() {
+  const now = performance.now();
+  const progress = Math.min((now - worldFade.start) / WORLD_FADE_MS, 1);
+  const eased = progress * progress * (3 - 2 * progress);
+  fadeMaterial.opacity = THREE.MathUtils.lerp(worldFade.from, worldFade.to, eased);
+}
+
+function applyPanoramaImage(dataUrl) {
+  return new Promise((resolve, reject) => {
+    new THREE.TextureLoader().load(
+      dataUrl,
+      (texture) => {
+        texture.colorSpace = THREE.SRGBColorSpace;
+        // Undoes the left/right mirroring that comes from viewing an
+        // equirectangular texture from inside the sphere (BackSide).
+        texture.wrapS = THREE.RepeatWrapping;
+        texture.repeat.x = -1;
+
+        const aspect = texture.image.width / texture.image.height;
+        panoramaMesh.geometry.dispose();
+        panoramaMesh.geometry = buildPanoramaGeometry(aspect);
+        panoramaMaterial.map = texture;
+        panoramaMaterial.needsUpdate = true;
+        panoramaMesh.visible = true;
+
+        resolve();
+      },
+      undefined,
+      reject,
+    );
+  });
+}
+
+let isGenerating = false;
+
+async function requestPanorama(prompt) {
+  try {
+    const response = await fetch(PANORAMA_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error || `Request failed with status ${response.status}`);
+    }
+
+    await applyPanoramaImage(`data:${data.mimeType};base64,${data.data}`);
+
+    setHudText('');
+  }
+  catch (err) {
+    console.error('Failed to generate panorama:', err);
+    setHudText("Sorry, I couldn't picture that. Try again.");
+  }
+  finally {
+    startFadeFromWhite();
+    isGenerating = false;
+  }
+}
+
 // --- Speech-to-text capture --------------------------------------------------
 // Hold the trigger on either controller, or press and hold anywhere on a
 // handheld AR screen, to record. WebXR's select events cover both input
@@ -378,11 +505,13 @@ async function handleRecordingStop() {
   catch (err) {
     console.error('Failed to process recording:', err);
     setHudText("Sorry, I didn't catch that.");
+    startFadeFromWhite();
+    isGenerating = false;
   }
 }
 
 function onSelectStart(event) {
-  if (activeInputSource || !micStream || !asrReady) {
+  if (activeInputSource || !micStream || !asrReady || isGenerating) {
     return;
   }
 
@@ -396,6 +525,8 @@ function onSelectEnd(event) {
   }
 
   activeInputSource = null;
+  isGenerating = true;
+  startFadeToWhite();
   stopRecording();
 }
 
@@ -407,6 +538,7 @@ renderer.xr.addEventListener('sessionstart', () => {
 
 renderer.xr.addEventListener('sessionend', () => {
   activeInputSource = null;
+  isGenerating = false;
   stopRecording();
 });
 
@@ -415,6 +547,7 @@ const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const delta = clock.getDelta();
   updateHud(delta);
+  updateWorldFade();
   renderer.render(scene, camera);
 });
 
